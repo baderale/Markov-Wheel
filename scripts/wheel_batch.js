@@ -662,7 +662,10 @@ function parseArgs(argv) {
 }
 function intArg(v, d) { return v == null ? d : Math.round(Number(v)); }
 function floatArg(v, d) { return v == null ? d : Number(v); }
-function fmt(n, dp) { return Number.isFinite(n) ? n.toFixed(dp) : '—'; }
+function fmt(n, dp) {
+  if (!Number.isFinite(n)) return '—';
+  return n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
 function pct(n) { return Number.isFinite(n) ? (n * 100).toFixed(0) + '%' : '—'; }
 
 function usage(code) {
