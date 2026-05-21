@@ -1,0 +1,14 @@
+node_modules/
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+
+# Generated scan reports — keep the sample CSV, ignore daily outputs
+scans/*.md
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp

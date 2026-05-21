@@ -1,0 +1,32 @@
+{
+  "name": "markov-wheel",
+  "version": "1.0.0",
+  "description": "Wheel Strategy scanner with Markov + Monte Carlo + behavioral signals",
+  "type": "module",
+  "main": "scripts/wheel_batch.js",
+  "scripts": {
+    "scan": "node scripts/wheel_batch.js --tickers scans/wheel_universe.csv",
+    "scan:verbose": "node scripts/wheel_batch.js --tickers scans/wheel_universe.csv --verbose"
+  },
+  "bin": {
+    "markov-wheel": "scripts/wheel_batch.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "wheel-strategy",
+    "options",
+    "cash-secured-put",
+    "monte-carlo",
+    "markov-chain",
+    "black-scholes",
+    "quant",
+    "trading"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/baderale/Markov-Wheel.git"
+  }
+}

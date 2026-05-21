@@ -1,0 +1,407 @@
+//@version=6
+// Wheel Triple — single-pane visual scorer for the Wheel Strategy.
+//
+// Combines three independent analytical layers, all computed natively on-chart:
+//   1. Markov chain — 4-state regime model (0=TREND_DOWN, 1=VOLATILE, 2=RANGE, 3=TREND_UP)
+//      classified each bar, 252-bar rolling history, Laplace-smoothed transition
+//      matrix raised to P^horizon (default 30) to get p_favorable = P(UP) + P(RANGE).
+//   2. Monte Carlo — GBM with 150 paths × DTE bars, drift + vol from 60-bar log
+//      returns, Box-Muller from seeded math.random. Outputs p_assign, p_touch,
+//      and 5/50/95 terminal percentiles for the recommended OTM strike.
+//   3. Behavioral — capitulation (+1.0), failed gap (+0.5), trap gap (-1.0),
+//      round-number anchor (+0.5); clamped to [-2, +2].
+//
+// Verdict ladder (final_score on a 0..6 scale):
+//   regimeAdj   = baseScore (0..4) * pFavorableMarkov (0..1)
+//   finalScore  = regimeAdj + behavioralAdj
+//     ≥4.5  ENTER_STRONG  "SELL PUT — high conviction"
+//     ≥3.0  ENTER         "SELL PUT"
+//     ≥1.5  WATCH         "WAIT — almost ready"
+//     <1.5  SKIP          "PASS"
+//   pFavorable < 0.50  →  SKIP_REGIME  "STAND DOWN — wrong regime"
+//   pAssign    > 0.40  →  knock one tier (ENTER_STRONG → ENTER → WATCH → SKIP)
+
+indicator("Wheel Triple", overlay=true, max_lines_count=20, max_labels_count=10, max_boxes_count=10)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────
+bbLen        = input.int(20,    "BB length",                group="Technical")
+bbMult       = input.float(2.0, "BB stddev",                group="Technical")
+bbPctMax     = input.float(0.25,"Max BB% (0=lower)",        group="Technical")
+smaLen       = input.int(50,    "SMA length",               group="Technical")
+trendBars    = input.int(72,    "Above-SMA bars",           group="Technical")
+rsiLen       = input.int(14,    "RSI length",               group="Technical")
+rsiMax       = input.int(60,    "RSI max for pass",         group="Technical")
+rsiStrong    = input.int(30,    "RSI strong-entry",         group="Technical")
+gapLookback  = input.int(30,    "Gap lookback bars",        group="Technical")
+gapPctIn     = input.float(0.10,"Gap % disqualify",         group="Technical")
+
+atrLen        = input.int(14,    "ATR length",              group="Regime / Markov")
+atrMedLen     = input.int(60,    "ATR median lookback",     group="Regime / Markov")
+atrMult       = input.float(1.5, "ATR vol-multiple",        group="Regime / Markov")
+rangeBand     = input.float(0.03,"Range band",              group="Regime / Markov")
+regimeHistLen = input.int(252,   "Regime history (bars)",   group="Regime / Markov")
+markovHorizon = input.int(30,    "Markov forecast horizon (bars)", group="Regime / Markov")
+laplaceAlpha  = input.float(1.0, "Laplace smoothing α",     group="Regime / Markov")
+
+mcPaths        = input.int(150,    "MC paths (max 250)",        group="Monte Carlo", maxval=250)
+mcDte          = input.int(37,     "DTE",                       group="Monte Carlo")
+mcVolLen       = input.int(60,     "Vol lookback bars",         group="Monte Carlo")
+mcStrikePctOTM = input.float(0.075,"Strike % OTM (~25Δ proxy)", group="Monte Carlo", step=0.005)
+mcStrikeIncr   = input.float(1.0,  "Strike rounding ($)",       group="Monte Carlo")
+// Pine MC is GBM only — bootstrap is infeasible (no persistent return series).
+// For bootstrap, use scripts/monte_carlo_strike.js via /wheel-scan.
+// math.random has no exposed seed control here; results vary slightly across recomputes.
+mcDowngradeAt  = input.float(0.40, "MC p_assign downgrade threshold", group="Monte Carlo")
+
+volZLen      = input.int(60,     "Volume Z lookback",        group="Behavioral")
+volZTrigger  = input.float(2.0,  "Volume Z capitulation",    group="Behavioral")
+gapDownPctIn = input.float(0.03, "Gap-down % trigger",       group="Behavioral")
+roundIncrSm  = input.float(5.0,  "Anchor — small",           group="Behavioral")
+roundIncrMd  = input.float(10.0, "Anchor — medium",          group="Behavioral")
+roundIncrLg  = input.float(50.0, "Anchor — large",           group="Behavioral")
+
+showDiag       = input.bool(false, "Show diagnostics — expand table", group="Display")
+showBG         = input.bool(true,  "Tint background on ENTER_STRONG", group="Display")
+showBands      = input.bool(true,  "Show BB + SMA50 on chart",        group="Display")
+showStrikeLine = input.bool(true,  "Draw recommended strike on chart", group="Display")
+showMCBands    = input.bool(true,  "Show MC 5/50/95 percentile bands", group="Display")
+tablePos       = input.string("top_left", "Table position", options=["top_right","top_left","bottom_right","bottom_left","middle_right"], group="Display")
+
+// ─── Studies ─────────────────────────────────────────────────────────────
+basis = ta.sma(close, bbLen)
+dev   = bbMult * ta.stdev(close, bbLen)
+upper = basis + dev
+lower = basis - dev
+sma50 = ta.sma(close, smaLen)
+rsi   = ta.rsi(close, rsiLen)
+atr   = ta.atr(atrLen)
+
+plot(showBands ? basis : na, color=color.new(color.gray,   70), title="BB Basis")
+plot(showBands ? upper : na, color=color.new(color.gray,   70), title="BB Upper")
+plot(showBands ? lower : na, color=color.new(color.gray,   70), title="BB Lower")
+plot(showBands ? sma50 : na, color=color.new(color.orange, 50), title="SMA50")
+
+// ─── Technical score ─────────────────────────────────────────────────────
+bbPct        = (close - lower) / (upper - lower)
+bbPass       = bbPct <= bbPctMax
+
+belowSma     = close < sma50
+barsAboveSma = ta.barssince(close < sma50)
+aboveSmaLong = not na(barsAboveSma) and barsAboveSma >= trendBars
+smaPass      = belowSma or aboveSmaLong
+
+rsiPass       = rsi <= rsiMax
+rsiStrongHit  = rsi <= rsiStrong
+rsiOverbought = rsi > 70
+
+gapHit = false
+for i = 1 to gapLookback
+    prevClose = close[i + 1]
+    curOpen   = open[i]
+    if not na(prevClose) and prevClose != 0
+        if math.abs(curOpen - prevClose) / prevClose >= gapPctIn
+            gapHit := true
+            break
+gapPass = not gapHit
+
+baseScore = (bbPass ? 1 : 0) + (smaPass ? 1 : 0) + (rsiPass ? 1 : 0) + (gapPass ? 1 : 0)
+
+// ─── Regime classifier (per bar, 4 states) ───────────────────────────────
+atrMedArr = array.new_float()
+for i = 0 to atrMedLen - 1
+    v = atr[i]
+    if not na(v)
+        array.push(atrMedArr, v)
+atrMed = array.size(atrMedArr) > 0 ? array.median(atrMedArr) : na
+
+isVolatile  = not na(atrMed) and atr > atrMult * atrMed
+distFromSma = na(sma50) or sma50 == 0 ? na : math.abs(close - sma50) / sma50
+isRange     = not na(distFromSma) and distFromSma <= rangeBand and rsi >= 40 and rsi <= 60
+isTrendUp   = close > sma50 and rsi >= 50 and rsi <= 70 and bbPct >= 0.4 and bbPct <= 0.8 and not isVolatile
+isTrendDown = close < sma50 and rsi < 50 and bbPct < 0.4 and not isVolatile
+
+// state encoding: 0=TREND_DOWN, 1=VOLATILE, 2=RANGE, 3=TREND_UP
+state = switch
+    isVolatile  => 1
+    isTrendUp   => 3
+    isTrendDown => 0
+    isRange     => 2
+    => 2
+
+// ─── Rolling regime history ──────────────────────────────────────────────
+var int[] regimeHist = array.new_int()
+if barstate.isconfirmed
+    array.push(regimeHist, state)
+    if array.size(regimeHist) > regimeHistLen
+        array.shift(regimeHist)
+
+// ─── Markov: transition matrix and P^horizon (last bar only) ─────────────
+var float pFavorableMarkov = 0.0
+var float pUpH    = 0.0
+var float pRangeH = 0.0
+var float pVolH   = 0.0
+var float pDownH  = 0.0
+
+if barstate.islast and array.size(regimeHist) >= 2
+    counts = matrix.new<float>(4, 4, laplaceAlpha)
+    for i = 1 to array.size(regimeHist) - 1
+        f = array.get(regimeHist, i - 1)
+        t = array.get(regimeHist, i)
+        counts.set(f, t, counts.get(f, t) + 1.0)
+    P = matrix.new<float>(4, 4, 0.0)
+    for r = 0 to 3
+        float rowSum = 0.0
+        for c = 0 to 3
+            rowSum := rowSum + counts.get(r, c)
+        for c = 0 to 3
+            P.set(r, c, counts.get(r, c) / rowSum)
+    Pn = matrix.copy(P)
+    if markovHorizon > 1
+        for k = 2 to markovHorizon
+            Pn := matrix.mult(Pn, P)
+    pUpH    := Pn.get(state, 3)
+    pRangeH := Pn.get(state, 2)
+    pVolH   := Pn.get(state, 1)
+    pDownH  := Pn.get(state, 0)
+    pFavorableMarkov := pUpH + pRangeH
+
+// ─── Monte Carlo (GBM, last bar only) ────────────────────────────────────
+logRet = na(close[1]) or close[1] == 0 ? na : math.log(close / close[1])
+mu     = ta.sma(logRet, mcVolLen)
+sigma  = ta.stdev(logRet, mcVolLen)
+
+var float pAssign   = 0.0
+var float pTouch    = 0.0
+var float p5        = na
+var float p50       = na
+var float p95       = na
+var float recStrike = na
+
+if barstate.islast and not na(mu) and not na(sigma) and sigma > 0
+    float drift = mu - 0.5 * sigma * sigma
+    terms = array.new_float(mcPaths)
+    mins  = array.new_float(mcPaths)
+    for p = 0 to mcPaths - 1
+        float s  = close
+        float lo = close
+        for t = 0 to mcDte - 1
+            u1 = math.random(0.0000001, 0.9999999)
+            u2 = math.random(0.0000001, 0.9999999)
+            z  = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+            s := s * math.exp(drift + sigma * z)
+            if s < lo
+                lo := s
+        array.set(terms, p, s)
+        array.set(mins,  p, lo)
+    float strikeRaw = close * (1.0 - mcStrikePctOTM)
+    recStrike := math.round(strikeRaw / mcStrikeIncr) * mcStrikeIncr
+    int assignN = 0
+    int touchN  = 0
+    for p = 0 to mcPaths - 1
+        if array.get(terms, p) < recStrike
+            assignN := assignN + 1
+        if array.get(mins, p) <= recStrike
+            touchN := touchN + 1
+    pAssign := assignN * 1.0 / mcPaths
+    pTouch  := touchN  * 1.0 / mcPaths
+    array.sort(terms)
+    p5  := array.get(terms, math.floor(0.05 * (mcPaths - 1)))
+    p50 := array.get(terms, math.floor(0.50 * (mcPaths - 1)))
+    p95 := array.get(terms, math.floor(0.95 * (mcPaths - 1)))
+
+// ─── Behavioral ──────────────────────────────────────────────────────────
+volSma   = ta.sma(volume, volZLen)
+volStdev = ta.stdev(volume, volZLen)
+volZ     = volStdev > 0 ? (volume - volSma) / volStdev : 0.0
+greenBar = close > open
+capitulation = volZ >= volZTrigger and rsi <= rsiStrong and greenBar
+
+gdPct     = close[1] != 0 ? (open - close[1]) / close[1] : 0.0
+gdHit     = gdPct <= -gapDownPctIn
+failedGap = gdHit and close > open
+trapGap   = gdHit and close <= open
+
+distSm = math.abs(close - math.round(close / roundIncrSm) * roundIncrSm) / close
+distMd = math.abs(close - math.round(close / roundIncrMd) * roundIncrMd) / close
+distLg = math.abs(close - math.round(close / roundIncrLg) * roundIncrLg) / close
+anchorHit = distSm < 0.005 or distMd < 0.005 or distLg < 0.005
+
+float behavioralAdj = 0.0
+if capitulation
+    behavioralAdj := behavioralAdj + 1.0
+if failedGap
+    behavioralAdj := behavioralAdj + 0.5
+if trapGap
+    behavioralAdj := behavioralAdj - 1.0
+if anchorHit
+    behavioralAdj := behavioralAdj + 0.5
+behavioralAdj := math.max(-2.0, math.min(2.0, behavioralAdj))
+
+// ─── Composite verdict ──────────────────────────────────────────────────
+regimeAdj  = baseScore * pFavorableMarkov
+finalScore = regimeAdj + behavioralAdj
+
+string verdictBase = switch
+    pFavorableMarkov < 0.5 => "SKIP_REGIME"
+    finalScore >= 4.5      => "ENTER_STRONG"
+    finalScore >= 3.0      => "ENTER"
+    finalScore >= 1.5      => "WATCH"
+    => "SKIP"
+
+bool mcDowngrade = pAssign > mcDowngradeAt
+string verdict = verdictBase
+if mcDowngrade
+    if verdictBase == "ENTER_STRONG"
+        verdict := "ENTER"
+    else if verdictBase == "ENTER"
+        verdict := "WATCH"
+    else if verdictBase == "WATCH"
+        verdict := "SKIP"
+
+actionText = switch verdict
+    "ENTER_STRONG" => "SELL PUT — high conviction"
+    "ENTER"        => "SELL PUT"
+    "WATCH"        => "WAIT — almost ready"
+    "SKIP_REGIME"  => "STAND DOWN — wrong regime"
+    => "PASS"
+
+verdictBg = switch verdict
+    "ENTER_STRONG" => color.new(color.lime,   0)
+    "ENTER"        => color.new(color.green,  0)
+    "WATCH"        => color.new(#cc9900,      0)
+    "SKIP_REGIME"  => color.new(color.orange, 0)
+    => color.new(color.red, 0)
+
+canEnter = verdict == "ENTER" or verdict == "ENTER_STRONG"
+
+// ─── Chart visuals ──────────────────────────────────────────────────────
+plot(showStrikeLine and canEnter and not na(recStrike) ? recStrike : na,
+     "Recommended Strike", color=color.new(color.lime, 0), linewidth=2, style=plot.style_linebr)
+
+bgcolor(showBG and verdict == "ENTER_STRONG" ? color.new(color.green, 92) : na)
+
+// MC forward bands — three lines extending DTE bars to the right
+var line p5Line  = na
+var line p50Line = na
+var line p95Line = na
+
+if barstate.islast and showMCBands and not na(p5)
+    line.delete(p5Line)
+    line.delete(p50Line)
+    line.delete(p95Line)
+    p5Line  := line.new(bar_index, p5,  bar_index + mcDte, p5,  color=color.new(color.red, 30),   width=1, style=line.style_solid)
+    p50Line := line.new(bar_index, p50, bar_index + mcDte, p50, color=color.new(color.gray, 30),  width=1, style=line.style_dashed)
+    p95Line := line.new(bar_index, p95, bar_index + mcDte, p95, color=color.new(color.green, 30), width=1, style=line.style_solid)
+
+// ─── Reason text ────────────────────────────────────────────────────────
+regimeName = switch state
+    0 => "TREND_DOWN"
+    1 => "VOLATILE"
+    2 => "RANGE"
+    3 => "TREND_UP"
+    => "?"
+
+string reason = switch
+    verdict == "SKIP_REGIME"                => "Regime " + regimeName + " — wait for shift"
+    mcDowngrade and not canEnter            => "MC p_assign " + str.tostring(pAssign * 100, "#") + "% — too risky"
+    mcDowngrade                             => "MC downgrade — p_assign " + str.tostring(pAssign * 100, "#") + "%"
+    rsiOverbought                           => "RSI overbought (" + str.tostring(rsi, "#") + ")"
+    capitulation                            => "Capitulation buying detected"
+    trapGap                                 => "Bear-trap gap-down"
+    failedGap                               => "Failed gap-down — buyers stepping in"
+    verdict == "ENTER_STRONG"               => "All three layers align"
+    verdict == "ENTER"                      => "Technicals + Markov + behavioral align"
+    verdict == "WATCH" and not bbPass       => "Price above lower BB — wait"
+    verdict == "WATCH" and not rsiPass      => "RSI elevated — wait"
+    verdict == "WATCH" and not smaPass      => "Trend uncertain"
+    verdict == "WATCH" and not gapPass      => "Recent ≥10% gap — avoid"
+    verdict == "WATCH"                      => "Borderline — not enough conviction"
+    not bbPass                              => "Price too high in BB"
+    not rsiPass                             => "RSI too high"
+    not smaPass                             => "Trend unclear"
+    not gapPass                             => "Recent ≥10% gap"
+    => "Below entry threshold"
+
+// ─── data_window plots ──────────────────────────────────────────────────
+plot(baseScore,         "Base score",           display=display.data_window)
+plot(pFavorableMarkov,  "P favorable (Markov)", display=display.data_window)
+plot(pAssign,           "MC p_assign",          display=display.data_window)
+plot(pTouch,            "MC p_touch",           display=display.data_window)
+plot(p5,                "MC p5",                display=display.data_window)
+plot(p50,               "MC p50",               display=display.data_window)
+plot(p95,               "MC p95",               display=display.data_window)
+plot(behavioralAdj,     "Behavioral adj",       display=display.data_window)
+plot(finalScore,        "Final score",          display=display.data_window)
+plot(state,             "Regime state",         display=display.data_window)
+plot(recStrike,         "Recommended strike",   display=display.data_window)
+
+// ─── Dashboard table ────────────────────────────────────────────────────
+posMap = switch tablePos
+    "top_left"     => position.top_left
+    "bottom_right" => position.bottom_right
+    "bottom_left"  => position.bottom_left
+    "middle_right" => position.middle_right
+    => position.top_right
+
+var table tCard = table.new(posMap, 2, 4,  border_width=3, border_color=color.new(color.white, 20), frame_width=3, frame_color=color.new(color.white, 10))
+var table tDiag = table.new(posMap, 2, 13, border_width=1, border_color=color.new(color.gray, 50))
+
+bgDark = color.new(color.black, 25)
+bgRow  = color.new(color.black, 70)
+
+strikeText = canEnter and not na(recStrike) ? "$" + str.tostring(recStrike, "#.##") + "  ·  " + str.tostring(mcDte) + " DTE" : "—"
+
+if barstate.islast
+    if showDiag
+        table.clear(tCard, 0, 0, 1, 3)
+        table.cell(tDiag, 0, 0,  "WHEEL TRIPLE",   bgcolor=bgDark, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 0,  syminfo.ticker,   bgcolor=bgDark, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 0, 1,  "ACTION",         bgcolor=bgRow,     text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 1,  actionText,       bgcolor=verdictBg, text_color=color.white, text_size=size.large)
+        table.cell(tDiag, 0, 2,  "Verdict",        bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 2,  verdict + (mcDowngrade ? "  (MC↓)" : ""), bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 0, 3,  "Score",          bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 3,  str.tostring(finalScore, "#.##") + " / 6.00",  bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        techStr = str.tostring(baseScore) + "/4   " + (bbPass ? "BB✓" : "BB✗") + " " + (smaPass ? "SMA✓" : "SMA✗") + " " + (rsiPass ? (rsiStrongHit ? "RSI★" : "RSI✓") : "RSI✗") + " " + (gapPass ? "Gap✓" : "Gap✗")
+        table.cell(tDiag, 0, 4,  "Technical",      bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 4,  techStr,          bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        markovStr = regimeName + " · p_fav " + str.tostring(pFavorableMarkov * 100, "#") + "%"
+        table.cell(tDiag, 0, 5,  "Markov",         bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 5,  markovStr,        bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        distStr = "U" + str.tostring(pUpH * 100, "#") + " R" + str.tostring(pRangeH * 100, "#") + " V" + str.tostring(pVolH * 100, "#") + " D" + str.tostring(pDownH * 100, "#")
+        table.cell(tDiag, 0, 6,  "P^" + str.tostring(markovHorizon),  bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 6,  distStr,          bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 0, 7,  "MC p_assign",    bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 7,  str.tostring(pAssign * 100, "#.#") + "%", bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 0, 8,  "MC p_touch",     bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 8,  str.tostring(pTouch * 100, "#.#") + "%", bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        pctStr = na(p5) ? "—" : "$" + str.tostring(p5, "#.##") + " / $" + str.tostring(p50, "#.##") + " / $" + str.tostring(p95, "#.##")
+        table.cell(tDiag, 0, 9,  "MC p5/p50/p95",  bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 9,  pctStr,           bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        behStr = (behavioralAdj >= 0 ? "+" : "") + str.tostring(behavioralAdj, "#.#")
+        if capitulation
+            behStr := behStr + "  cap"
+        if failedGap
+            behStr := behStr + "  failG"
+        if trapGap
+            behStr := behStr + "  trapG"
+        if anchorHit
+            behStr := behStr + "  anchor"
+        table.cell(tDiag, 0, 10, "Behavioral",     bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 10, behStr,           bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 0, 11, "Strike",         bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 11, strikeText,       bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        rsiTxt = str.tostring(rsi, "#.#") + (rsiOverbought ? " ⚠OB" : rsiStrongHit ? " ★OS" : "")
+        bbTxt  = "RSI " + rsiTxt + "  ·  BB " + str.tostring(bbPct * 100, "#") + "%"
+        table.cell(tDiag, 0, 12, "RSI / BB%",      bgcolor=bgRow, text_color=color.white, text_size=size.small)
+        table.cell(tDiag, 1, 12, bbTxt,            bgcolor=bgRow, text_color=color.white, text_size=size.small)
+    else
+        table.clear(tDiag, 0, 0, 1, 12)
+        table.cell(tCard, 0, 0,  "WHEEL TRIPLE",   bgcolor=bgDark,    text_color=color.white, text_size=size.large)
+        table.cell(tCard, 1, 0,  syminfo.ticker,   bgcolor=bgDark,    text_color=color.white, text_size=size.large)
+        table.cell(tCard, 0, 1,  "ACTION",         bgcolor=bgRow,     text_color=color.white, text_size=size.large)
+        table.cell(tCard, 1, 1,  actionText,       bgcolor=verdictBg, text_color=color.white, text_size=size.huge)
+        table.cell(tCard, 0, 2,  "Strike",         bgcolor=bgRow,     text_color=color.white, text_size=size.large)
+        table.cell(tCard, 1, 2,  strikeText,       bgcolor=bgRow,     text_color=color.yellow, text_size=size.huge)
+        table.cell(tCard, 0, 3,  "Why",            bgcolor=bgRow,     text_color=color.white, text_size=size.normal)
+        table.cell(tCard, 1, 3,  reason,           bgcolor=bgRow,     text_color=color.white, text_size=size.normal)
